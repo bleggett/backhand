@@ -4,11 +4,12 @@ use std::process::Command;
 use std::time::Duration;
 
 use assert_cmd::prelude::*;
-use backhand::{FilesystemReader, FilesystemWriter};
+use backhand::{FilesystemReader, FilesystemWriter, NodeHeader};
 use criterion::*;
 use tempfile::tempdir;
 use test_assets_ureq::dl_test_files_backoff;
 use test_assets_ureq::TestAssetDef;
+use std::path::Path;
 
 fn read_write(file: File, offset: u64) {
     let file = BufReader::new(file);
@@ -23,6 +24,75 @@ fn read_write(file: File, offset: u64) {
 fn read(file: File, offset: u64) {
     let file = BufReader::new(file);
     black_box(FilesystemReader::from_reader_with_offset(file, offset).unwrap());
+}
+
+fn write(file: File, offset: u64) {
+    let file = BufReader::new(file);
+    black_box(FilesystemReader::from_reader_with_offset(file, offset).unwrap());
+}
+
+fn add_directory_contents(dir: &Path, base: &Path, writer: &mut FilesystemWriter) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let metadata = entry.metadata().unwrap();
+
+        let relative_path = path.strip_prefix(base).unwrap();
+        let fs_path = format!("/{}", relative_path.to_string_lossy());
+
+        if metadata.is_dir() {
+            writer.push_dir(&fs_path, NodeHeader::default()).unwrap();
+            add_directory_contents(&path, base, writer);
+        } else if metadata.is_file() {
+            let file_data = std::fs::read(&path).unwrap();
+            writer.push_file(Cursor::new(file_data), &fs_path, NodeHeader::default()).unwrap();
+        }
+    }
+}
+
+pub fn bench_write_new(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write_new");
+    group.sampling_mode(SamplingMode::Flat);
+    group.sample_size(10);
+
+
+    const FILE_NAME: &str = "img-1571203182_vol-ubi_rootfs.ubifs";
+    let asset_defs = [TestAssetDef {
+        filename: FILE_NAME.to_string(),
+        hash: "e6adbea10615a8ed9f88e403e2478010696f421f4d69a790d37d97fe8921aa81".to_string(),
+        url: format!("https://wcampbell.dev/squashfs/testing/test_tplink1800/{FILE_NAME}"),
+    }];
+    const TEST_PATH: &str = "test-assets/test_tplink_ax1800";
+
+    dl_test_files_backoff(&asset_defs, TEST_PATH, true, Duration::from_secs(1)).unwrap();
+
+    let tmp_dir = tempdir().unwrap();
+    let og_path = format!("{TEST_PATH}/{FILE_NAME}");
+    let tmp_path = tmp_dir.path().join("squashfs-out");
+    let _ = std::fs::create_dir_all(&tmp_path);
+
+    let cmd = Command::new(assert_cmd::cargo::cargo_bin("unsquashfs-backhand"))
+        .env("RUST_LOG", "none")
+        .args([
+            "--auto-offset",
+            "--quiet",
+            "-d",
+            tmp_path.to_str().unwrap(),
+            &og_path,
+        ])
+        .unwrap();
+    cmd.assert().code(&[0] as &[i32]);
+
+    group.bench_function("tplink_ax1800", |b| {
+        b.iter(|| {
+            let mut writer = FilesystemWriter::default();
+            add_directory_contents(&tmp_path, &tmp_path, &mut writer);
+            let output_file = tempfile::tempfile().unwrap();
+            black_box(writer.write(output_file).unwrap());
+        })
+    });
+
+    group.finish();
 }
 
 pub fn bench_read_write(c: &mut Criterion) {
@@ -188,5 +258,5 @@ pub fn bench_unsquashfs_extract(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_read_write, bench_read, bench_unsquashfs_extract);
+criterion_group!(benches, bench_write_new, bench_read_write, bench_read, bench_unsquashfs_extract);
 criterion_main!(benches);
