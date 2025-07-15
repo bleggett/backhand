@@ -215,6 +215,12 @@ impl<'a> DataWriter<'a> {
         reader: impl Read,
         mut writer: W,
     ) -> Result<(usize, Added), BackhandError> {
+        // Fast path for uncompressed data - use direct streaming
+        if self.fs_compressor.id == crate::compressor::Compressor::None && self.dup_cache.is_none() {
+            return self.add_bytes_uncompressed_fast(reader, writer);
+        }
+
+        // Original path for compressed data or when duplicate checking is enabled
         let mut chunk_reader = DataWriterChunkReader {
             chunk: vec![0u8; self.block_size as usize],
             file_len: 0,
@@ -257,7 +263,11 @@ impl<'a> DataWriter<'a> {
 
         // Save information needed to add to duplicate_cache later
         let chunk_len = chunk.len();
-        let hash = xxh64(chunk, 0);
+        let hash = if self.dup_cache.is_some() {
+            xxh64(chunk, 0)
+        } else {
+            0 // dummy value when duplicate checking is disabled
+        };
 
         while !chunk.is_empty() {
             // Optimize for uncompressed data - avoid unnecessary compression call
@@ -296,6 +306,51 @@ impl<'a> DataWriter<'a> {
             }
         }
         Ok(added)
+    }
+
+    /// Optimized fast path for uncompressed data without duplicate checking
+    fn add_bytes_uncompressed_fast<W: WriteSeek>(
+        &mut self,
+        mut reader: impl Read,
+        mut writer: W,
+    ) -> Result<(usize, Added), BackhandError> {
+        // Read the entire file into memory first to determine size
+        let mut file_data = Vec::new();
+        let total_bytes = reader.read_to_end(&mut file_data)?;
+
+        // Handle small files as fragments
+        if total_bytes < self.block_size as usize {
+            // if this doesn't fit in the current fragment bytes, finalize current fragments
+            if (total_bytes + self.fragment_bytes.len()) > self.block_size as usize {
+                self.finalize(&mut writer)?;
+            }
+
+            // add to fragment bytes
+            let frag_index = self.fragment_table.len() as u32;
+            let block_offset = self.fragment_bytes.len() as u32;
+            self.fragment_bytes.extend_from_slice(&file_data);
+
+            return Ok((total_bytes, Added::Fragment { frag_index, block_offset }));
+        }
+
+        // Handle large files as data blocks
+        let blocks_start = writer.stream_position()? as u32;
+        let mut block_sizes = Vec::new();
+        let mut remaining_data = &file_data[..];
+
+        while !remaining_data.is_empty() {
+            let chunk_size = std::cmp::min(remaining_data.len(), self.block_size as usize);
+            let chunk = &remaining_data[..chunk_size];
+            
+            // Store directly without compression
+            block_sizes.push(DataSize::new_uncompressed(chunk_size as u32));
+            writer.write_all(chunk)?;
+            
+            remaining_data = &remaining_data[chunk_size..];
+        }
+
+        let added = Added::Data { blocks_start, block_sizes };
+        Ok((total_bytes, added))
     }
 
     /// Compress the fragments that were under length, write to data, add to fragment table, clear
