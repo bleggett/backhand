@@ -177,17 +177,24 @@ impl<'a> DataWriter<'a> {
             if block.fragment {
                 reader.decompress(block, &mut read_buf, &mut decompress_buf)?;
                 // TODO: support tail-end fragments, for now just treat it like a block
-                let cb =
-                    self.kind.compress(&decompress_buf, self.fs_compressor, self.block_size)?;
-                // compression didn't reduce size
-                if cb.len() > decompress_buf.len() {
+                
+                // Optimize for uncompressed data - avoid unnecessary compression call
+                if self.fs_compressor.id == crate::compressor::Compressor::None {
                     // store uncompressed
                     block_sizes.push(DataSize::new_uncompressed(decompress_buf.len() as u32));
                     writer.write_all(&decompress_buf)?;
                 } else {
-                    // store compressed
-                    block_sizes.push(DataSize::new_compressed(cb.len() as u32));
-                    writer.write_all(&cb)?;
+                    let cb = self.kind.compress(&decompress_buf, self.fs_compressor, self.block_size)?;
+                    // compression didn't reduce size
+                    if cb.len() > decompress_buf.len() {
+                        // store uncompressed
+                        block_sizes.push(DataSize::new_uncompressed(decompress_buf.len() as u32));
+                        writer.write_all(&decompress_buf)?;
+                    } else {
+                        // store compressed
+                        block_sizes.push(DataSize::new_compressed(cb.len() as u32));
+                        writer.write_all(&cb)?;
+                    }
                 }
             } else {
                 //if is a block, just copy it
@@ -253,17 +260,24 @@ impl<'a> DataWriter<'a> {
         let hash = xxh64(chunk, 0);
 
         while !chunk.is_empty() {
-            let cb = self.kind.compress(chunk, self.fs_compressor, self.block_size)?;
-
-            // compression didn't reduce size
-            if cb.len() > chunk.len() {
-                // store uncompressed
+            // Optimize for uncompressed data - avoid unnecessary compression call
+            if self.fs_compressor.id == crate::compressor::Compressor::None {
+                // Store directly without compression
                 block_sizes.push(DataSize::new_uncompressed(chunk.len() as u32));
                 writer.write_all(chunk)?;
             } else {
-                // store compressed
-                block_sizes.push(DataSize::new_compressed(cb.len() as u32));
-                writer.write_all(&cb)?;
+                let cb = self.kind.compress(chunk, self.fs_compressor, self.block_size)?;
+
+                // compression didn't reduce size
+                if cb.len() > chunk.len() {
+                    // store uncompressed
+                    block_sizes.push(DataSize::new_uncompressed(chunk.len() as u32));
+                    writer.write_all(chunk)?;
+                } else {
+                    // store compressed
+                    block_sizes.push(DataSize::new_compressed(cb.len() as u32));
+                    writer.write_all(&cb)?;
+                }
             }
             chunk = chunk_reader.read_chunk()?;
         }
@@ -287,18 +301,30 @@ impl<'a> DataWriter<'a> {
     /// Compress the fragments that were under length, write to data, add to fragment table, clear
     /// current fragment_bytes
     pub fn finalize<W: Write + Seek>(&mut self, mut writer: W) -> Result<(), BackhandError> {
+        if self.fragment_bytes.is_empty() {
+            return Ok(());
+        }
+        
         let start = writer.stream_position()?;
-        let cb = self.kind.compress(&self.fragment_bytes, self.fs_compressor, self.block_size)?;
-
-        // compression didn't reduce size
-        let size = if cb.len() > self.fragment_bytes.len() {
-            // store uncompressed
+        
+        // Optimize for uncompressed data - avoid unnecessary compression call
+        let size = if self.fs_compressor.id == crate::compressor::Compressor::None {
+            // Store directly without compression
             writer.write_all(&self.fragment_bytes)?;
             DataSize::new_uncompressed(self.fragment_bytes.len() as u32)
         } else {
-            // store compressed
-            writer.write_all(&cb)?;
-            DataSize::new_compressed(cb.len() as u32)
+            let cb = self.kind.compress(&self.fragment_bytes, self.fs_compressor, self.block_size)?;
+
+            // compression didn't reduce size
+            if cb.len() > self.fragment_bytes.len() {
+                // store uncompressed
+                writer.write_all(&self.fragment_bytes)?;
+                DataSize::new_uncompressed(self.fragment_bytes.len() as u32)
+            } else {
+                // store compressed
+                writer.write_all(&cb)?;
+                DataSize::new_compressed(cb.len() as u32)
+            }
         };
         self.fragment_table.push(Fragment::new(start, size, 0));
         self.fragment_bytes.clear();
