@@ -8,7 +8,7 @@ use solana_nohash_hasher::IntMap;
 use tracing::trace;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::compressor::CompressionAction;
+use crate::compressor::{Compressor, CompressionAction};
 use crate::error::BackhandError;
 use crate::filesystem::writer::FilesystemCompressor;
 use crate::fragment::Fragment;
@@ -156,18 +156,22 @@ impl<'a> DataWriter<'a> {
 
         // write and early return if fragment
         if first_block.fragment {
-            reader.decompress(first_block, &mut read_buf, &mut decompress_buf)?;
-            // if this doesn't fit in the current fragment bytes
-            // compress the current fragment bytes and add to data_bytes
-            if (decompress_buf.len() + self.fragment_bytes.len()) > self.block_size as usize {
-                self.finalize(writer)?;
-            }
-            // add to fragment bytes
-            let frag_index = self.fragment_table.len() as u32;
-            let block_offset = self.fragment_bytes.len() as u32;
-            self.fragment_bytes.write_all(&decompress_buf)?;
+            if first_block.uncompressed {
+                writer.write_all(&read_buf)?;
+            } else {
+                reader.decompress(first_block, &mut read_buf, &mut decompress_buf)?;
+                // if this doesn't fit in the current fragment bytes
+                // compress the current fragment bytes and add to data_bytes
+                if (decompress_buf.len() + self.fragment_bytes.len()) > self.block_size as usize {
+                    self.finalize(writer)?;
+                }
+                // add to fragment bytes
+                let frag_index = self.fragment_table.len() as u32;
+                let block_offset = self.fragment_bytes.len() as u32;
+                self.fragment_bytes.write_all(&decompress_buf)?;
 
-            return Ok((decompress_buf.len(), Added::Fragment { frag_index, block_offset }));
+                return Ok((decompress_buf.len(), Added::Fragment { frag_index, block_offset }));
+            }
         }
 
         //if is a block, just copy it
@@ -228,7 +232,7 @@ impl<'a> DataWriter<'a> {
             // add to fragment bytes
             let frag_index = self.fragment_table.len() as u32;
             let block_offset = self.fragment_bytes.len() as u32;
-            self.fragment_bytes.write_all(chunk)?;
+            self.fragment_bytes.extend_from_slice(chunk);
 
             return Ok((chunk_reader.file_len, Added::Fragment { frag_index, block_offset }));
         }
@@ -253,17 +257,21 @@ impl<'a> DataWriter<'a> {
         let hash = xxh64(chunk, 0);
 
         while !chunk.is_empty() {
-            let cb = self.kind.compress(chunk, self.fs_compressor, self.block_size)?;
-
-            // compression didn't reduce size
-            if cb.len() > chunk.len() {
-                // store uncompressed
+            if self.fs_compressor.id != Compressor::None {
+                let cb = self.kind.compress(chunk, self.fs_compressor, self.block_size)?;
+                // compression didn't reduce size
+                if cb.len() > chunk.len() {
+                    // store uncompressed
+                    block_sizes.push(DataSize::new_uncompressed(chunk.len() as u32));
+                    writer.write_all(chunk)?;
+                } else {
+                    // store compressed
+                    block_sizes.push(DataSize::new_compressed(cb.len() as u32));
+                    writer.write_all(&cb)?;
+                }
+            } else {
                 block_sizes.push(DataSize::new_uncompressed(chunk.len() as u32));
                 writer.write_all(chunk)?;
-            } else {
-                // store compressed
-                block_sizes.push(DataSize::new_compressed(cb.len() as u32));
-                writer.write_all(&cb)?;
             }
             chunk = chunk_reader.read_chunk()?;
         }
